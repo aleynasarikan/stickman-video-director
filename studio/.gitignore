@@ -1,0 +1,9 @@
+node_modules/
+dist/
+data/
+.env
+*.log
+.venv-tts/
+.venv-kizagan/
+models/
+__pycache__/
