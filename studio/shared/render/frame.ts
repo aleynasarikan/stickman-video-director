@@ -1,6 +1,6 @@
 import type { Character, Project, Scene } from "../schema";
 import { sequencePose } from "../rig";
-import { buildTimeline, punchAt, spanAt, cueAt, type SceneSpan, type SubtitleCue } from "../timeline";
+import { buildTimeline, punchAt, spanAt, cueAt, mouthAt, sceneWords, type SceneSpan, type SubtitleCue, type WordTime } from "../timeline";
 import { Painter, PALETTES, SKETCH_SET, type Ctx } from "./painter";
 import { drawBackground, type Stage } from "./background";
 import { drawFigure } from "./figure";
@@ -15,6 +15,8 @@ export interface FrameOptions {
   height: number;
   cues?: SubtitleCue[];
   subtitles?: boolean;
+  /** Loaded background images by scene id (optional generated assets); others are drawn. */
+  backgrounds?: ReadonlyMap<string, CanvasImageSource & { width: number; height: number }>;
 }
 
 const FADE_SEC = 0.45;
@@ -86,7 +88,20 @@ function actorX(fromX: number, toX: number, travel: number, stage: Stage) {
   return stage.W * (0.12 + x * 0.76);
 }
 
-export function drawScene(ctx: Ctx, project: Project, span: SceneSpan, localT: number, stage: Stage) {
+/**
+ * `speech` is the scene's narration as spoken words (scene-relative times). When present, the
+ * first actor with a "talk" action is the speaker: their mouth follows the words, and every
+ * other mouth stays closed, whatever the action sequence says at that moment.
+ */
+export function drawScene(
+  ctx: Ctx,
+  project: Project,
+  span: SceneSpan,
+  localT: number,
+  stage: Stage,
+  speech: WordTime[] = [],
+  backdrop?: CanvasImageSource & { width: number; height: number },
+) {
   const scene = span.scene;
   const style = project.settings.style;
   const pal = PALETTES[style];
@@ -95,12 +110,16 @@ export function drawScene(ctx: Ctx, project: Project, span: SceneSpan, localT: n
   const dur = scene.durationSec;
   const k = Math.min(1, Math.max(0, localT / dur));
 
+  const speaker = speech.length ? scene.actors.findIndex((a) => a.actions.includes("talk")) : -1;
+  const lips = speaker >= 0 ? mouthAt(speech, localT) : 0;
+
   const figures = scene.actors.flatMap((a, i) => {
     const character = chars.get(a.characterId);
     if (!character) return [];
     const seq = sequencePose(a.actions, localT, dur);
     const { travel, action, actionT } = seq;
     let pose = seq.pose;
+    if (speaker >= 0) pose = { ...pose, mouthOpen: i === speaker ? lips : 0 };
     // A reporter's microphone goes to their own mouth while they speak, to the guest otherwise.
     if (a.prop === "microphone" && !["walk", "run", "jump", "fall", "sleep", "push"].includes(action))
       pose = { ...pose, armFront: action === "talk" ? [0.55, 2.2] : [1.3 + Math.sin(localT * 1.3) * 0.04, 0.2] };
@@ -136,7 +155,8 @@ export function drawScene(ctx: Ctx, project: Project, span: SceneSpan, localT: n
   ctx.save();
   ctx.translate(cam.tx, cam.ty);
   ctx.scale(cam.s, cam.s);
-  if (cine) drawCinematicBackground(ctx, scene, stage, localT);
+  if (backdrop) drawBackdrop(ctx, backdrop, stage);
+  else if (cine) drawCinematicBackground(ctx, scene, stage, localT);
   else if (style === "sketch") {
     drawBackground(new Painter(ctx, SKETCH_SET), scene, stage, style, localT);
     paperGrid(ctx, stage);
@@ -159,12 +179,26 @@ export function drawScene(ctx: Ctx, project: Project, span: SceneSpan, localT: n
       setting: scene.setting,
     });
   }
-  if (cine) drawCinematicForeground(ctx, scene, stage);
+  if (cine && !backdrop) drawCinematicForeground(ctx, scene, stage);
   ctx.restore();
   if (cine) gradeFrame(ctx, scene, stage.W, stage.H);
   if (scene.caption?.trim()) drawCaption(ctx, scene.caption.trim(), localT, stage);
   if (style === "news") drawNewsGraphics(ctx, project, span, localT, stage);
   else if (scene.headline?.trim()) drawHeadline(ctx, scene.headline.trim(), localT, dur, stage, style, hashString(scene.id));
+}
+
+/**
+ * A generated background image, scaled to cover the stage plus a margin so camera pans and
+ * zooms never reveal its edges. Drawn in world space so it moves with the camera.
+ */
+function drawBackdrop(ctx: Ctx, img: CanvasImageSource & { width: number; height: number }, stage: Stage) {
+  const m = 0.15;
+  const W = stage.W * (1 + 2 * m);
+  const H = stage.H * (1 + 2 * m);
+  const k = Math.max(W / img.width, H / img.height);
+  const w = img.width * k;
+  const h = img.height * k;
+  ctx.drawImage(img, stage.W / 2 - w / 2, stage.H / 2 - h / 2, w, h);
 }
 
 /** Faint squared paper under the sketch style (64 px at 720p), drawn in world space so it moves with the camera. */
@@ -381,7 +415,7 @@ export function renderFrame(ctx: Ctx, project: Project, t: number, opts: FrameOp
 
   ctx.fillStyle = pal.bg;
   ctx.fillRect(0, 0, opts.width, opts.height);
-  drawScene(ctx, project, span, localT, stage);
+  drawScene(ctx, project, span, localT, stage, sceneWords(opts.cues, span), opts.backgrounds?.get(span.scene.id));
 
   // Fade in from the background colour (scene transitions) and fade out at the very end.
   let fade = 0;

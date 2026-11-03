@@ -22,7 +22,9 @@ export function RenderStep({ project, renders, onRendered, onBack, beforeRender 
 
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
-  const poll = (id: string) => {
+  // A dropped request (the server restarting, a network blip) is retried for a few seconds; a
+  // job the server no longer knows ends the wait, so the buttons never stay disabled.
+  const poll = (id: string, misses = 0) => {
     timer.current = window.setTimeout(async () => {
       try {
         const j = await api.job(id);
@@ -31,9 +33,12 @@ export function RenderStep({ project, renders, onRendered, onBack, beforeRender 
         else if (j.status === "done") onRendered();
         else setError(j.error ?? t.error);
       } catch (e) {
-        setError((e as Error).message);
+        const gone = (e as { status?: number }).status === 404;
+        if (!gone && misses < 8) return poll(id, misses + 1);
+        setJob((cur) => (cur ? { ...cur, status: "error" } : cur));
+        setError(gone ? t.jobLost : (e as Error).message);
       }
-    }, 600);
+    }, misses ? 1000 : 600);
   };
 
   const start = async (preview = false) => {
@@ -51,23 +56,25 @@ export function RenderStep({ project, renders, onRendered, onBack, beforeRender 
   const running = job?.status === "running";
 
   return (
-    <div className="render-step">
+    <div className={`render-step ${renders.length > 1 ? "" : "solo"}`}>
       <section className="panel render-panel">
         <div className="panel-head">
           <h2>{project.title}</h2>
-          <button className="ghost" onClick={onBack}>← {t.back}</button>
+          <button className="outline" onClick={onBack}>{t.back}</button>
         </div>
-        <p className="muted">
-          {project.scenes.length} sahne · {project.settings.aspect} · {project.settings.voiceover ? t.voiceover : "Sessiz"}
-          {project.settings.subtitles ? ` · ${t.subtitles}` : ""}
-        </p>
+        <div className="render-meta">
+          <span className="chip">{project.scenes.length} sahne</span>
+          <span className="chip">{project.settings.aspect === "16:9" ? t.landscape : t.portrait}</span>
+          <span className="chip">{project.settings.voiceover ? t.voiceover : "Sessiz"}</span>
+          {project.settings.subtitles && <span className="chip">{t.subtitles}</span>}
+        </div>
 
         {pending > 0 && <div className="alert warn">{t.approvalNeeded(pending)}</div>}
 
         {running && job && (
           <div className="progress">
             <div className="progress-label">
-              <span>{t.phases[job.phase] ?? t.rendering}</span>
+              <span><span className="tally" aria-hidden />{t.phases[job.phase] ?? t.rendering}</span>
               <span>{Math.round(job.progress * 100)}%</span>
             </div>
             <div className="bar"><div style={{ width: `${Math.round(job.progress * 100)}%` }} /></div>
@@ -75,11 +82,11 @@ export function RenderStep({ project, renders, onRendered, onBack, beforeRender 
         )}
         {error && <div className="alert error">{error}</div>}
 
-        <div className="btn-row">
-          <button className="ghost big" disabled={pending > 0 || running} onClick={() => start(true)}>
+        <div className="render-actions">
+          <button className="outline big" disabled={pending > 0 || running} onClick={() => start(true)}>
             {t.preview}
           </button>
-          <button className="primary big" disabled={pending > 0 || running} onClick={() => start(false)}>
+          <button className="onair big" disabled={pending > 0 || running} onClick={() => start(false)}>
             {running ? t.rendering : latest ? t.rerender : t.render}
           </button>
         </div>
@@ -94,7 +101,7 @@ export function RenderStep({ project, renders, onRendered, onBack, beforeRender 
             />
             <div className="btn-row">
               <a className="button primary" href={`${latest}?download=1`}>⬇ {t.downloadMp4}</a>
-              {latestSrt && <a className="button ghost" href={`${latestSrt}?download=1`}>{t.downloadSrt}</a>}
+              {latestSrt && <a className="button outline" href={`${latestSrt}?download=1`}>{t.downloadSrt}</a>}
             </div>
             {job?.result?.preview && <div className="alert info">{t.previewNote}</div>}
             {job?.result?.notes.map((n) => <div className="alert warn" key={n}>{n}</div>)}

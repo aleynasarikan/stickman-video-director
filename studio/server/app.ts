@@ -1,9 +1,9 @@
-import express, { type NextFunction, type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type RequestHandler, type Response } from "express";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { z, ZodError } from "zod";
-import { AI_PLANNERS, CreateProjectRequest, PLANNER_LABEL, Project, type AiPlannerKind } from "../shared/schema";
+import { AI_PLANNERS, ASSET_FILE_RE, CreateProjectRequest, PLANNER_LABEL, Project, type AiPlannerKind } from "../shared/schema";
 import { newId, normalizeDraft, normalizeScene, sceneDuration, type DraftPlan } from "../shared/draft";
 import type { Planner } from "./planner/types";
 import { OfflinePlanner } from "./planner/offline";
@@ -15,13 +15,24 @@ import type { TtsEngine } from "./tts";
 import { renderVideo, type RenderPhase } from "./render";
 import { NewsError, fetchNews } from "./news";
 import { comicBulletin } from "./news-bulletin";
+import { WorkQueue } from "./gate";
+import { findAsset, saveAsset, type AssetConfig } from "./assets";
 
 export interface AppDeps {
   store: ProjectStore;
   /** Configured LLM planners (only those with an API key). */
   ai: Partial<Record<AiPlannerKind, { planner: Planner; model: string; paid: boolean }>>;
   tts: (language: string) => Promise<TtsEngine | null>;
+  /** Built web app (npm run build) served from the same port, with SPA fallback. */
   webDist?: string;
+  /** Development: serves the web app instead of webDist (Vite middleware with live reload), same port. */
+  frontend?: RequestHandler;
+  /** Renders and image generation share this queue (one at a time by default). */
+  heavy?: WorkQueue;
+  /** Optional local image service for scene backgrounds; absent/null = drawn backgrounds only. */
+  assets?: AssetConfig;
+  /** Which TTS engines are installed (shown in /api/status). */
+  ttsInventory?: () => Record<string, boolean>;
 }
 
 interface Job {
@@ -68,6 +79,7 @@ export function createApp(deps: AppDeps) {
   const offline = new OfflinePlanner();
   const jobs = new Map<string, Job>();
   const activeByProject = new Map<string, string>();
+  const heavy = deps.heavy ?? new WorkQueue(1);
 
   app.use(express.json({ limit: "1mb" }));
 
@@ -94,8 +106,10 @@ export function createApp(deps: AppDeps) {
         return [k, p ? { model: p.model, paid: p.paid } : null];
       }),
     );
-    // Voice choices need EMA Lightning or Kızağan; macOS say has a single Turkish voice.
-    res.json({ planners, tts: { tr: Boolean(tr), en: Boolean(en), voices: tr?.name === "ema-lightning" || tr?.name === "kizagan", engine: tr?.name } });
+    // Voice choices need an engine with voices (EMA Lightning, Kızağan, …); macOS say has a single Turkish voice.
+    const assets = { provider: deps.assets?.provider?.name ?? null, problem: deps.assets?.problem };
+    const installed = deps.ttsInventory?.();
+    res.json({ planners, tts: { tr: Boolean(tr), en: Boolean(en), voices: Boolean(tr?.voices), engine: tr?.name, ...(installed && { installed }) }, assets });
   }));
 
   // Headlines and short summaries from an RSS/Atom feed or an article page, for news bulletins.
@@ -209,7 +223,11 @@ export function createApp(deps: AppDeps) {
     const ids = new Set(incoming.characters.map((c) => c.id));
     for (const s of incoming.scenes)
       for (const a of s.actors) if (!ids.has(a.characterId)) throw new HttpError(400, `Sahnede bilinmeyen karakter: ${a.characterId}`);
-    const project = await deps.store.save({ ...incoming, createdAt: existing.createdAt, updatedAt: new Date().toISOString() });
+    // Generated backgrounds are owned by the server (set and cleared only by their own endpoints),
+    // so an autosave from a page that has not seen a fresh image yet can never drop it.
+    const saved = new Map(existing.scenes.map((s) => [s.id, s.background]));
+    const scenes = incoming.scenes.map(({ background: _ignored, ...s }) => (saved.get(s.id) ? { ...s, background: saved.get(s.id) } : s));
+    const project = await deps.store.save({ ...incoming, scenes, createdAt: existing.createdAt, updatedAt: new Date().toISOString() });
     res.json({ project });
   }));
 
@@ -249,6 +267,8 @@ export function createApp(deps: AppDeps) {
       return res.status(202).json({ jobId: running });
     }
     const job: Job = { id: newId("job"), projectId: project.id, status: "running", phase: "queued", progress: 0, startedAt: Date.now() };
+    // Finished jobs are kept an hour for late pollers, then dropped so the map does not grow forever.
+    for (const [id, j] of jobs) if (j.status !== "running" && Date.now() - j.startedAt > 3_600_000) jobs.delete(id);
     jobs.set(job.id, job);
     activeByProject.set(project.id, job.id);
     res.status(202).json({ jobId: job.id });
@@ -256,10 +276,13 @@ export function createApp(deps: AppDeps) {
     const outDir = deps.store.rendersDir(project.id);
     await mkdir(outDir, { recursive: true });
     const tts = project.settings.voiceover ? await deps.tts(project.settings.language) : null;
-    renderVideo(project, outDir, tts, (phase, k) => {
-      job.phase = phase;
-      job.progress = phase === "voice" ? k * 0.15 : phase === "frames" ? 0.15 + k * 0.8 : 0.97;
-    }, undefined, { previewSec: preview ? PREVIEW_SEC : undefined })
+    // Waits (phase "queued") while another render or an image generation is running.
+    heavy.run(() =>
+      renderVideo(project, outDir, tts, (phase, k) => {
+        job.phase = phase;
+        job.progress = phase === "voice" ? k * 0.15 : phase === "frames" ? 0.15 + k * 0.8 : 0.97;
+      }, undefined, { previewSec: preview ? PREVIEW_SEC : undefined, assetsDir: deps.store.assetsDir(project.id) }),
+    )
       .then((r) => {
         const file = path.basename(r.file);
         job.status = "done";
@@ -280,9 +303,66 @@ export function createApp(deps: AppDeps) {
       });
   }));
 
+  // Optional: generate a background image for one scene with the local image service.
+  // Never needed to render; without a configured, running service this answers 503.
+  app.post("/api/projects/:id/scenes/:index/background", wrap(async (req, res) => {
+    const provider = deps.assets?.provider;
+    if (!provider) throw new HttpError(503, deps.assets?.problem ?? "Görsel üretimi kapalı (ASSET_PROVIDER ayarlanmadı). Sahneler çizilen arka planla üretilir.");
+    const project = await load(String(req.params.id));
+    const index = Number(req.params.index);
+    const scene = project.scenes[index];
+    if (!Number.isInteger(index) || !scene) throw new HttpError(400, "Geçersiz sahne.");
+    const prompt =
+      z.string().trim().min(3).max(600).optional().parse(req.body?.prompt || undefined) ??
+      `${scene.visualNote || scene.title}, empty background scene, no people, no text, flat illustration`;
+    const portrait = project.settings.aspect === "9:16";
+    const ask = { prompt, width: portrait ? 576 : 1024, height: portrait ? 1024 : 576 };
+    const dir = deps.store.assetsDir(project.id);
+    // Same prompt and size as an earlier image in this project: reuse it, no model run.
+    let file = await findAsset(dir, ask);
+    const reused = Boolean(file);
+    if (!file) {
+      if (!(await provider.available())) throw new HttpError(503, "Görsel servisi çalışmıyor; çizilen arka plan kullanılmaya devam edecek.");
+      const img = await heavy.run(() => provider.generate(ask));
+      file = await saveAsset(dir, ask, img);
+    }
+    // Re-read so edits saved while the image was generating are kept.
+    const latest = await load(project.id);
+    const target = latest.scenes.find((s) => s.id === scene.id);
+    if (!target) throw new HttpError(409, "Sahne bu sırada silindi.");
+    target.background = { file, prompt };
+    await deps.store.save({ ...latest, updatedAt: new Date().toISOString() });
+    res.json({ scene: target, reused });
+  }));
+
+  // Back to the drawn background. The image stays in the assets folder for reuse.
+  app.delete("/api/projects/:id/scenes/:index/background", wrap(async (req, res) => {
+    const project = await load(String(req.params.id));
+    const scene = project.scenes[Number(req.params.index)];
+    if (!scene) throw new HttpError(400, "Geçersiz sahne.");
+    delete scene.background;
+    await deps.store.save({ ...project, updatedAt: new Date().toISOString() });
+    res.json({ scene });
+  }));
+
+  // Generated images, for the browser preview.
+  app.get("/media/:id/assets/:file", (req, res, next) => {
+    const file = String(req.params.file);
+    if (!ASSET_FILE_RE.test(file)) return res.status(400).end();
+    let dir: string;
+    try {
+      dir = deps.store.assetsDir(String(req.params.id));
+    } catch {
+      return res.status(400).end();
+    }
+    res.sendFile(path.join(dir, file), { maxAge: "1d", immutable: true }, (err?: Error) => {
+      if (err && !res.headersSent) next(new HttpError(404, "Dosya bulunamadı."));
+    });
+  });
+
   app.get("/api/jobs/:id", (req, res) => {
     const job = jobs.get(String(req.params.id));
-    if (!job) return res.status(404).json({ error: "İş bulunamadı." });
+    if (!job) return res.status(404).json({ error: "İş bulunamadı: sunucu yeniden başlamış olabilir. Videoyu yeniden üretin." });
     res.json(job);
   });
 
@@ -302,9 +382,15 @@ export function createApp(deps: AppDeps) {
     });
   });
 
-  if (deps.webDist && existsSync(deps.webDist)) {
+  // An unknown API address answers JSON 404 instead of falling through to the web page.
+  app.use("/api", (_req, res) => res.status(404).json({ error: "Bilinmeyen API adresi." }));
+
+  // The web app on the same port as the API: no second server, no proxy, no CORS.
+  if (deps.frontend) app.use(deps.frontend);
+  else if (deps.webDist && existsSync(deps.webDist)) {
     app.use(express.static(deps.webDist));
-    app.get(/^(?!\/api|\/media).*/, (_req, res) => res.sendFile(path.join(deps.webDist!, "index.html")));
+    // Page addresses (/?p=…, any client path) get index.html; /api and /media never do.
+    app.get(/^(?!\/api\/|\/media\/).*/, (_req, res) => res.sendFile(path.join(deps.webDist!, "index.html")));
   }
 
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

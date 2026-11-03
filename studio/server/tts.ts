@@ -20,6 +20,8 @@ export interface Clip {
 
 export interface TtsEngine {
   readonly name: string;
+  /** True if the engine honours the narrator voice choice (kadın, erkek, …); false/absent = one voice. */
+  readonly voices?: boolean;
   /** Writes speech to `outWav`. Engines without voices ignore `voice`. */
   synthesize(text: string, language: string, outWav: string, voice?: VoiceId): Promise<Clip>;
 }
@@ -53,6 +55,8 @@ export class WorkerTts implements TtsEngine {
   private ready: Promise<void> | null = null;
   private pending = new Map<number, Pending>();
   private nextId = 1;
+
+  readonly voices = true;
 
   constructor(
     readonly name: string,
@@ -89,7 +93,7 @@ export class WorkerTts implements TtsEngine {
         if (msg.ready) {
           clearTimeout(timer);
           resolve();
-        } else if (msg.fatal) fail(new Error(`EMA Lightning yüklenemedi: ${msg.fatal}`));
+        } else if (msg.fatal) fail(new Error(`${this.label} yüklenemedi: ${msg.fatal}`));
         else if (msg.id != null) {
           const p = this.pending.get(msg.id);
           this.pending.delete(msg.id);
@@ -157,12 +161,45 @@ export class KizaganTts extends WorkerTts {
   }
 }
 
+/**
+ * Pocket TTS Turkish (CC-BY-4.0 weights, Apache-2.0 code; credit Kyutai and the Turkish fine-tune).
+ * Optional and off unless TTS_ENGINE names it. Runs in its own Python env (studio/.venv-pocket)
+ * through scripts/pocket_tts_worker.py, which speaks the same JSON-lines protocol as EMA's worker.
+ * It reports no word timings, so the exporter aligns its words to the audio (server/align.ts).
+ */
+export class PocketTts extends WorkerTts {
+  constructor(python: string, script = path.join(root, "scripts", "pocket_tts_worker.py"), startTimeoutMs = 120_000) {
+    super("pocket-tts", "Pocket TTS", python, script, startTimeoutMs);
+  }
+}
+
+/** FreyaTTS-small (Apache-2.0): optional, same protocol, own env (studio/.venv-freya), no word timings. */
+export class FreyaTts extends WorkerTts {
+  constructor(python: string, script = path.join(root, "scripts", "freya_tts_worker.py"), startTimeoutMs = 120_000) {
+    super("freya-tts", "FreyaTTS", python, script, startTimeoutMs);
+  }
+}
+
 /** The worker sends words as [text, start, end]; anything malformed is dropped. */
 function parseWords(raw: unknown): WordTime[] {
   if (!Array.isArray(raw)) return [];
   return raw.flatMap((w) =>
     Array.isArray(w) && typeof w[0] === "string" && Number.isFinite(w[1]) && Number.isFinite(w[2]) ? [{ text: w[0], start: Number(w[1]), end: Number(w[2]) }] : [],
   );
+}
+
+/**
+ * Engines that failed several clips in a row are skipped for a while, so a broken optional
+ * provider (one that hangs at start-up, say) costs one timeout rather than one per scene.
+ * Kept per engine object because detectTts() builds a new chain for every request.
+ */
+const BREAKER_FAILS = 2;
+const BREAKER_MS = 5 * 60_000;
+const failures = new WeakMap<TtsEngine, { count: number; until: number }>();
+
+function resting(engine: TtsEngine, now = Date.now()): boolean {
+  const f = failures.get(engine);
+  return Boolean(f && f.count >= BREAKER_FAILS && now < f.until);
 }
 
 /** Tries the preferred engine and, if it fails, falls back to the next one for that clip. */
@@ -173,14 +210,26 @@ export class FallbackTts implements TtsEngine {
     return this.engines[0].name;
   }
 
+  get voices() {
+    return Boolean(this.engines[0].voices);
+  }
+
   async synthesize(text: string, language: string, outWav: string, voice?: VoiceId): Promise<Clip> {
     let last: unknown;
-    for (const [i, engine] of this.engines.entries()) {
+    // A resting engine is still tried if it is the only one left.
+    const usable = this.engines.filter((e, i) => !resting(e) || i === this.engines.length - 1);
+    for (const [i, engine] of usable.entries()) {
       try {
-        return await engine.synthesize(text, language, outWav, voice);
+        const clip = await engine.synthesize(text, language, outWav, voice);
+        failures.delete(engine);
+        return clip;
       } catch (e) {
         last = e;
-        if (i < this.engines.length - 1) console.warn(`${engine.name} başarısız, ${this.engines[i + 1].name} deneniyor: ${(e as Error).message}`);
+        const f = failures.get(engine) ?? { count: 0, until: 0 };
+        f.count++;
+        f.until = Date.now() + BREAKER_MS;
+        failures.set(engine, f);
+        if (i < usable.length - 1) console.warn(`${engine.name} başarısız, ${usable[i + 1].name} deneniyor: ${(e as Error).message}`);
       }
     }
     throw last;
@@ -199,8 +248,35 @@ export function kizaganPython(): string | null {
   return existsSync(p) && existsSync(path.join(model, "model.safetensors")) ? p : null;
 }
 
+/** An optional provider's Python, if both it and its worker script are present. */
+function optionalPython(envVar: string, venv: string, script: string): string | null {
+  const p = process.env[envVar] || path.join(root, venv, "bin", "python");
+  return existsSync(p) && existsSync(path.join(root, "scripts", script)) ? p : null;
+}
+
+export const pocketPython = () => optionalPython("POCKET_PYTHON", ".venv-pocket", "pocket_tts_worker.py");
+export const freyaPython = () => optionalPython("FREYA_PYTHON", ".venv-freya", "freya_tts_worker.py");
+
 let ema: EmaTts | null = null;
 let kizagan: KizaganTts | null = null;
+let pocket: PocketTts | null = null;
+let freya: FreyaTts | null = null;
+
+/** Which engines are installed on this machine (for /api/status); nothing is started. */
+export function ttsInventory(): Record<string, boolean> {
+  return {
+    kizagan: Boolean(kizaganPython()),
+    "ema-lightning": Boolean(emaPython()),
+    "pocket-tts": Boolean(pocketPython()),
+    "freya-tts": Boolean(freyaPython()),
+    "macos-say": process.platform === "darwin",
+  };
+}
+
+/** Stops every TTS worker process (server shutdown). They restart on the next request. */
+export function closeTtsWorkers() {
+  for (const w of [ema, kizagan, pocket, freya]) w?.close();
+}
 
 async function detectMacSay(language: string): Promise<MacSayTts | null> {
   if (process.platform !== "darwin") return null;
@@ -213,14 +289,59 @@ async function detectMacSay(language: string): Promise<MacSayTts | null> {
   }
 }
 
+const OPTIONAL = ["pocket", "freya"] as const;
+
+/** The optional engine named `kind`, or null if it is not installed. */
+function optionalEngine(kind: (typeof OPTIONAL)[number]): TtsEngine | null {
+  if (kind === "pocket") {
+    const p = pocketPython();
+    return p ? (pocket ??= new PocketTts(p)) : null;
+  }
+  const p = freyaPython();
+  return p ? (freya ??= new FreyaTts(p)) : null;
+}
+
 /**
- * TTS_ENGINE: empty = best available for Turkish (Kızağan, then EMA Lightning, then macOS say,
- * each falling back to the next for a failed clip); "kizagan", "ema" or "say" to force one;
- * "none" to disable narration.
+ * TTS_ENGINE:
+ * - empty: best available for Turkish (Kızağan, then EMA Lightning, then macOS say, each falling
+ *   back to the next for a failed clip). Pocket and Freya are never picked automatically.
+ * - "kizagan", "ema" or "say": that engine only (unchanged behaviour).
+ * - "pocket" / "freya", or a list such as "freya,pocket": those first, in that order, then the
+ *   automatic chain as a safety net. A missing one is skipped with a log line.
+ * - "none": no narration.
  */
 export async function detectTts(language: string): Promise<TtsEngine | null> {
-  const choice = process.env.TTS_ENGINE || "";
+  const choice = (process.env.TTS_ENGINE || "").trim().toLowerCase();
   if (choice === "none") return null;
+  const listed = choice.split(",").map((c) => c.trim()).filter(Boolean);
+  if (listed.length && listed.every((c) => (OPTIONAL as readonly string[]).includes(c))) {
+    const preferred: TtsEngine[] = [];
+    if (language === "tr") {
+      for (const kind of listed as (typeof OPTIONAL)[number][]) {
+        const e = optionalEngine(kind);
+        if (e) preferred.push(e);
+        else warnOnce(`TTS_ENGINE=${kind} seçili ama kurulu değil; EMA Lightning kullanılacak.`);
+      }
+    }
+    return chain([...preferred, ...(await autoChain(language))]);
+  }
+  return chain(await autoChain(language, choice));
+}
+
+function chain(engines: TtsEngine[]): TtsEngine | null {
+  if (!engines.length) return null;
+  return engines.length === 1 ? engines[0] : new FallbackTts(engines);
+}
+
+const warned = new Set<string>();
+function warnOnce(msg: string) {
+  if (warned.has(msg)) return;
+  warned.add(msg);
+  console.warn(msg);
+}
+
+/** The original selection: Kızağan → EMA → say for "" (auto), or only the one engine named. */
+async function autoChain(language: string, choice = ""): Promise<TtsEngine[]> {
   const engines: TtsEngine[] = [];
   if (language === "tr") {
     const kp = choice === "" || choice === "kizagan" ? kizaganPython() : null;
@@ -232,6 +353,5 @@ export async function detectTts(language: string): Promise<TtsEngine | null> {
     const say = await detectMacSay(language);
     if (say) engines.push(say);
   }
-  if (!engines.length) return null;
-  return engines.length === 1 ? engines[0] : new FallbackTts(engines);
+  return engines;
 }

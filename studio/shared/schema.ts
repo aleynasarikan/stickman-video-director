@@ -93,6 +93,9 @@ export const Actor = z.object({
 });
 export type Actor = z.infer<typeof Actor>;
 
+/** File names allowed in a project's assets folder (no paths, image types only). */
+export const ASSET_FILE_RE = /^[\w-]{1,80}\.(png|jpe?g)$/;
+
 export const Scene = z.object({
   id: z.string().min(1),
   title: z.string().max(80),
@@ -113,6 +116,11 @@ export const Scene = z.object({
   caption: z.string().max(60).optional(),
   /** Meme sound stings for this scene. */
   stings: z.array(z.enum(MEME_SFX)).max(3).optional(),
+  /**
+   * Optional generated background image in the project's assets folder. Absent (every existing
+   * project) or missing on disk = the scene's drawn Canvas background, exactly as before.
+   */
+  background: z.object({ file: z.string().regex(ASSET_FILE_RE), prompt: z.string().max(600) }).optional(),
 });
 export type Scene = z.infer<typeof Scene>;
 

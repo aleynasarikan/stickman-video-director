@@ -42,6 +42,9 @@ export function spanAt(spans: SceneSpan[], t: number): SceneSpan {
   return spans[spans.length - 1];
 }
 
+/** Silence before each scene's narration starts (the exporter pads the voice clip by this much). */
+export const SPEECH_LEAD = 0.15;
+
 // Short phrases read faster than full sentences and keep the picture visible.
 const MAX_CUE_CHARS = 34;
 
@@ -133,9 +136,38 @@ export function estimateSpeechSec(text: string, language: string): number {
 
 export function buildCues(spans: SceneSpan[], speechSec: (span: SceneSpan) => number, words?: (span: SceneSpan) => WordTime[] | undefined): SubtitleCue[] {
   return spans.flatMap((s) => {
-    const sec = Math.min(speechSec(s), s.end - s.start - 0.3);
-    return sceneCues(s.scene.narration, s.start + 0.3, sec, words?.(s));
+    const sec = Math.min(speechSec(s), s.end - s.start - SPEECH_LEAD);
+    return sceneCues(s.scene.narration, s.start + SPEECH_LEAD, sec, words?.(s));
   });
+}
+
+/** The spoken words inside one scene, in seconds from the scene's start. */
+export function sceneWords(cues: SubtitleCue[] | undefined, span: { start: number; end: number }): WordTime[] {
+  if (!cues) return [];
+  return cues
+    .filter((c) => c.start >= span.start - 1e-6 && c.start < span.end)
+    .flatMap((c) => c.words ?? [])
+    .map((w) => ({ text: w.text, start: w.start - span.start, end: w.end - span.start }));
+}
+
+// The picture leads the sound by about a frame, which reads as in sync.
+const LIP_LEAD = 0.04;
+
+/**
+ * How open the speaker's mouth is at `t` (0 = closed): one open-close per syllable of the word
+ * being spoken, closed between words and when nobody is speaking.
+ */
+export function mouthAt(words: WordTime[], t: number): number {
+  const at = t + LIP_LEAD;
+  for (const w of words) {
+    if (at < w.start) return 0;
+    if (at < w.end) {
+      const syl = Math.max(1, (w.text.match(VOWELS) ?? []).length);
+      const phase = ((at - w.start) / Math.max(0.05, w.end - w.start)) * syl;
+      return 0.2 + 0.8 * Math.abs(Math.sin(Math.PI * phase));
+    }
+  }
+  return 0;
 }
 
 export function cueAt(cues: SubtitleCue[], t: number): SubtitleCue | undefined {

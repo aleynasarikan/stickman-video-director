@@ -118,6 +118,36 @@ def normalize_tr(text):
     return re.sub(r"\s+", " ", t).strip()
 
 
+# Turkish letter names, for acronyms read letter by letter ("TBMM" → "te be me me").
+LETTER_NAMES = {
+    "A": "a", "B": "be", "C": "ce", "Ç": "çe", "D": "de", "E": "e", "F": "fe", "G": "ge", "Ğ": "yumuşak ge",
+    "H": "he", "I": "ı", "İ": "i", "J": "je", "K": "ke", "L": "le", "M": "me", "N": "ne", "O": "o", "Ö": "ö",
+    "P": "pe", "R": "re", "S": "se", "Ş": "şe", "T": "te", "U": "u", "Ü": "ü", "V": "ve", "Y": "ye", "Z": "ze",
+}
+
+
+def pocket_prenormalize(text):
+    """
+    Fixes, before Pocket TTS Turkish's own normalizer runs, the two cases it reads wrongly:
+    an acronym with an apostrophe suffix ("TBMM'de" became "...Mecliside", "AB'ye" became "ABye")
+    is spelled letter by letter with its suffix ("te be me me de"), and an ordinal before a word
+    ("89. dakikada") is written out so no pause is inserted after it. Dates, times, prices and
+    bare acronyms are left to Pocket, which reads them correctly.
+    """
+    t = re.sub(
+        r"\b([A-ZÇĞİÖŞÜ]{2,6})['’]([a-zçğıöşü]+)",
+        lambda m: " ".join(LETTER_NAMES.get(c, c.lower()) for c in m.group(1)) + " " + m.group(2),
+        text,
+    )
+    t = re.sub(
+        rf"(?<![\d.])(\d+)\.(?=\s+(?:[a-zçğıöşü]|(?:{ORDINAL_NOUNS})))",
+        lambda m: ordinal_words(int(m.group(1))),
+        t,
+        flags=re.IGNORECASE,
+    )
+    return t
+
+
 def split_sentences(text):
     """Sentence-sized pieces (the model is most natural one utterance at a time); an ordinal's dot doesn't split."""
     parts = re.split(r"(?<=[.!?…])\s+(?=[^\s])", text.strip())

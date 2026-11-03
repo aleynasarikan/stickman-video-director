@@ -99,27 +99,27 @@ export function NewsPanel({ settings, busy, planner, onBrief }: Props) {
   return (
     <section className="panel news-panel">
       <h2>{t.newsTitle}</h2>
-      <p className="muted">{t.newsHint}</p>
+      <p className="lede">{t.newsHint}</p>
       <div className="news-fetch">
         <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder={t.newsUrl} aria-label={t.newsUrl} />
         <button className="primary" disabled={loading || busy || url.trim().length < 8} onClick={() => load()}>
           {loading ? t.newsFetching : t.newsFetch}
         </button>
       </div>
-      <div className="story-meta">
+      <div className="presets">
         {PRESETS.map((p) => (
-          <button key={p.url} className="link" disabled={loading} onClick={() => { setUrl(p.url); load(p.url); }}>
+          <button key={p.url} className={url === p.url ? "outline on" : "outline"} disabled={loading} onClick={() => { setUrl(p.url); load(p.url); }}>
             {p.label}
           </button>
         ))}
       </div>
       {error && <div className="alert error">{error}</div>}
       {items.length === 0 && (
-        <div className="field">
+        <div className="field news-form" style={{ marginTop: 18 }}>
           <label>{t.newsSubject}</label>
           <div className="news-fetch">
             <input value={subject} maxLength={200} placeholder={t.newsSubjectPlaceholder} onChange={(e) => setSubject(e.target.value)} />
-            <button className="primary" disabled={subject.trim().length < 3 || busy || building} onClick={() => { setMode("interview"); build("interview"); }}>
+            <button className="outline" disabled={subject.trim().length < 3 || busy || building} onClick={() => { setMode("interview"); build("interview"); }}>
               {building ? t.newsBuilding : t.newsInterviewOnly}
             </button>
           </div>
@@ -141,7 +141,7 @@ export function NewsPanel({ settings, busy, planner, onBrief }: Props) {
               </li>
             ))}
           </ul>
-          <div className="row">
+          <div className="row news-form">
             <div className="field">
               <label>{t.newsBulletinTitle}</label>
               <input value={title} maxLength={60} onChange={(e) => setTitle(e.target.value)} />
@@ -177,10 +177,10 @@ export function NewsPanel({ settings, busy, planner, onBrief }: Props) {
               </select>
             </div>
           </div>
-          {mode !== "classic" && <p className="muted small">{t.newsComicNote(mode, planner === "offline" ? null : PLANNER_LABEL[planner])}</p>}
-          <div className="story-meta">
+          {mode !== "classic" && <p className="muted small" style={{ marginTop: 14, maxWidth: "72ch" }}>{t.newsComicNote(mode, planner === "offline" ? null : PLANNER_LABEL[planner])}</p>}
+          <div className="news-actions">
             <button className="primary" disabled={!canBuild || busy || building} onClick={() => build()}>{building ? t.newsBuilding : t.newsBuild}</button>
-            <span className="muted small">{t.newsSelected(chosen.length, max)}</span>
+            <span className="count">{t.newsSelected(chosen.length, max)}</span>
           </div>
           {mode === "interview" && (
             <div className="field">

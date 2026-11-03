@@ -16,6 +16,47 @@ interface Props {
   onSeekScene?: (index: number) => void;
 }
 
+type Backdrop = HTMLImageElement & { width: number; height: number };
+
+// Decoded images shared by every player on the page (thumbnails and the main preview).
+const imageCache = new Map<string, Promise<Backdrop | null>>();
+
+function loadBackdrop(url: string): Promise<Backdrop | null> {
+  let p = imageCache.get(url);
+  if (!p) {
+    p = new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img as Backdrop);
+      img.onerror = () => resolve(null); // missing file: the scene is drawn as before
+      img.src = url;
+    });
+    imageCache.set(url, p);
+  }
+  return p;
+}
+
+/** The project's generated scene backgrounds that have loaded, by scene id (same as the exporter uses). */
+function useBackdrops(project: Project): ReadonlyMap<string, Backdrop> {
+  const key = project.scenes.map((s) => (s.background ? `${s.id}:${s.background.file}` : "")).join("|");
+  const [map, setMap] = useState<ReadonlyMap<string, Backdrop>>(new Map());
+  useEffect(() => {
+    let live = true;
+    const wanted = project.scenes.filter((s) => s.background);
+    if (!wanted.length) {
+      setMap(new Map());
+      return;
+    }
+    Promise.all(wanted.map(async (s) => [s.id, await loadBackdrop(`/media/${project.id}/assets/${s.background!.file}`)] as const)).then((pairs) => {
+      if (live) setMap(new Map(pairs.filter((p): p is [string, Backdrop] => p[1] !== null)));
+    });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.id, key]);
+  return map;
+}
+
 function fmt(t: number) {
   const s = Math.max(0, Math.floor(t));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -41,6 +82,7 @@ export function Player({ project, sceneIndex, displayWidth, controls, playing: p
     () => buildCues(spans, (s) => estimateSpeechSec(s.scene.narration, view.settings.language)),
     [spans, view.settings.language],
   );
+  const backgrounds = useBackdrops(project);
   const logical = canvasSize(view.settings.aspect);
   const displayHeight = Math.round((displayWidth * logical.height) / logical.width);
 
@@ -57,7 +99,7 @@ export function Player({ project, sceneIndex, displayWidth, controls, playing: p
       c.height = ph;
     }
     ctx.setTransform(pw / logical.width, 0, 0, ph / logical.height, 0, 0);
-    renderFrame(ctx, view, t, { ...logical, cues, subtitles: view.settings.subtitles && sceneIndex === undefined });
+    renderFrame(ctx, view, t, { ...logical, cues, subtitles: view.settings.subtitles && sceneIndex === undefined, backgrounds });
   };
 
   // Clamp the playhead when the edited project gets shorter.
@@ -94,7 +136,7 @@ export function Player({ project, sceneIndex, displayWidth, controls, playing: p
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playing, view, displayWidth, total, still, cues]);
+  }, [playing, view, displayWidth, total, still, cues, backgrounds]);
 
   const seek = (t: number) => {
     timeRef.current = t;

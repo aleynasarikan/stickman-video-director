@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { createCanvas } from "@napi-rs/canvas";
+import { createCanvas, loadImage, type Image } from "@napi-rs/canvas";
 import { FPS, canvasSize, type Project } from "../shared/schema";
-import { buildTimeline, buildCues, estimateSpeechSec, narrationWordTimes, type SubtitleCue, type WordTime } from "../shared/timeline";
+import { SPEECH_LEAD, buildTimeline, buildCues, estimateSpeechSec, narrationWordTimes, type SubtitleCue, type WordTime } from "../shared/timeline";
 import { sfxEvents } from "../shared/sfx";
 import { mixSfx, writeWav } from "./sfx";
 import { registerFonts } from "./fonts";
@@ -11,12 +11,33 @@ import { renderFrame } from "../shared/render/frame";
 import type { Ctx } from "../shared/render/painter";
 import { ffmpeg, ffmpegPath } from "./ffmpeg";
 import type { TtsEngine } from "./tts";
+import { alignClipWords } from "./align";
 
 export type RenderPhase = "voice" | "frames" | "encode";
 
 export interface RenderOptions {
   /** Render only about this many seconds from the start (a quick check with sound), as preview-*.mp4. */
   previewSec?: number;
+  /** The project's assets folder, for scenes with a generated background. */
+  assetsDir?: string;
+}
+
+/**
+ * Loads the scenes' optional background images. A missing or unreadable file is skipped with a
+ * note, and that scene is drawn by Canvas as usual. Each image is decoded once per render.
+ */
+async function loadBackdrops(project: Project, assetsDir: string | undefined, notes: string[]) {
+  const out = new Map<string, Image>();
+  if (!assetsDir) return out;
+  for (const s of project.scenes) {
+    if (!s.background) continue;
+    try {
+      out.set(s.id, await loadImage(path.join(assetsDir, path.basename(s.background.file))));
+    } catch {
+      notes.push(`"${s.title || s.id}" sahnesinin arka plan görseli okunamadı; çizilen arka plan kullanıldı.`);
+    }
+  }
+  return out;
 }
 
 export interface RenderResult {
@@ -28,8 +49,15 @@ export interface RenderResult {
   preview: boolean;
 }
 
-const SPEECH_LEAD = 0.3; // seconds of silence before each scene's narration
-const SPEECH_TAIL = 0.6;
+// After a line ends, the scene holds this long before the next one starts...
+const SPEECH_TAIL = 0.35;
+// ...or up to this long if the planner asked for a longer scene (room for a visual gag),
+// so a short line in a 6-second planned scene no longer leaves seconds of dead air.
+const MAX_HOLD = 0.5;
+// The shortest a spoken scene gets, so a one-word line is still readable on screen.
+const MIN_SPOKEN_SCENE = 1.6;
+// Silence the TTS engine leaves around the words is trimmed down to this much.
+const CLIP_MARGIN = 0.05;
 
 function srtTime(t: number): string {
   const ms = Math.round(t * 1000);
@@ -47,23 +75,39 @@ export function toSrt(cues: SubtitleCue[]): string {
 async function buildNarration(project: Project, tts: TtsEngine, work: string, onProgress: (k: number) => void) {
   const speech: number[] = [];
   const words: (WordTime[] | undefined)[] = [];
+  const trims: number[] = [];
   const scenes = project.scenes;
   for (let i = 0; i < scenes.length; i++) {
     const text = scenes[i].narration.trim();
     if (!text) {
       speech.push(0);
       words.push(undefined);
+      trims.push(0);
       continue;
     }
     const voice = scenes[i].voice ?? project.settings.voice ?? "kadin";
-    const clip = await tts.synthesize(text, project.settings.language, path.join(work, `voice-${i}.wav`), voice);
-    speech.push(clip.duration);
-    words.push(narrationWordTimes(scenes[i].narration, clip.duration, clip.words));
+    const wav = path.join(work, `voice-${i}.wav`);
+    const clip = await tts.synthesize(text, project.settings.language, wav, voice);
+    // EMA reports its own word timings (used as they are). Engines that don't get their words
+    // aligned to the silences in the audio; if that fails, the syllable estimate over the clip.
+    const aligned = clip.words?.length ? null : await alignClipWords(wav, scenes[i].narration);
+    const timed = aligned ?? narrationWordTimes(scenes[i].narration, clip.duration, clip.words);
+    const measured = Boolean(clip.words?.length || aligned);
+    // With measured word timings, cut the engine's leading/trailing silence so lines follow each other.
+    const from = measured ? Math.max(0, timed[0].start - CLIP_MARGIN) : 0;
+    const to = measured ? Math.min(clip.duration, timed[timed.length - 1].end + CLIP_MARGIN) : clip.duration;
+    trims.push(from);
+    speech.push(Math.max(0.1, to - from));
+    words.push(timed.map((w) => ({ text: w.text, start: w.start - from, end: w.end - from })));
     onProgress((i + 1) / scenes.length);
   }
-  // Scenes stretch so narration always fits; they never shrink below the planned length.
+  // A spoken scene lasts as long as its line plus a short hold: it stretches when the voice is
+  // longer than planned and shrinks when the plan left more than MAX_HOLD of silence.
   scenes.forEach((s, i) => {
-    if (speech[i] > 0) s.durationSec = Math.max(s.durationSec, Math.ceil((speech[i] + SPEECH_LEAD + SPEECH_TAIL) * 10) / 10);
+    if (speech[i] <= 0) return;
+    const fit = speech[i] + SPEECH_LEAD + SPEECH_TAIL;
+    const d = Math.max(MIN_SPOKEN_SCENE, fit, Math.min(s.durationSec, speech[i] + SPEECH_LEAD + MAX_HOLD));
+    s.durationSec = Math.ceil(d * 10) / 10;
   });
 
   const padded: string[] = [];
@@ -72,7 +116,8 @@ async function buildNarration(project: Project, tts: TtsEngine, work: string, on
     const d = scenes[i].durationSec.toFixed(3);
     if (speech[i] > 0) {
       const lead = Math.round(SPEECH_LEAD * 1000);
-      await ffmpeg(["-i", path.join(work, `voice-${i}.wav`), "-af", `adelay=${lead},apad`, "-t", d, "-ar", "44100", "-ac", "1", "-c:a", "pcm_s16le", out]);
+      const trim = trims[i] > 0 ? `atrim=start=${trims[i].toFixed(3)},asetpts=PTS-STARTPTS,` : "";
+      await ffmpeg(["-i", path.join(work, `voice-${i}.wav`), "-af", `${trim}adelay=${lead},apad`, "-t", d, "-ar", "44100", "-ac", "1", "-c:a", "pcm_s16le", out]);
     } else {
       await ffmpeg(["-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", d, "-c:a", "pcm_s16le", out]);
     }
@@ -115,6 +160,9 @@ export async function renderVideo(
   if (opts.previewSec) previewScenes(project, opts.previewSec);
   const work = path.join(outDir, `.work-${stamp}`);
   await mkdir(work, { recursive: true });
+  // Marks the folder as in use by this process, so a start-up cleanup in another server instance
+  // on the same data folder leaves it alone (see ProjectStore.cleanupStaleWork).
+  await writeFile(path.join(work, "owner.pid"), String(process.pid));
 
   try {
     let narration: string | null = null;
@@ -132,6 +180,7 @@ export async function renderVideo(
       }
     }
 
+    const backgrounds = await loadBackdrops(project, opts.assetsDir, notes);
     const { spans, total: full } = buildTimeline(project.scenes);
     const total = opts.previewSec ? Math.min(full, opts.previewSec) : full;
     const cues = buildCues(spans, (s) => speech[s.index], (s) => words[s.index]);
@@ -173,7 +222,10 @@ export async function renderVideo(
         proc.kill("SIGKILL");
         throw new Error("Üretim iptal edildi.");
       }
-      renderFrame(ctx, project, f / FPS, { width, height, cues, subtitles: project.settings.subtitles });
+      renderFrame(ctx, project, f / FPS, {
+        width, height, cues, subtitles: project.settings.subtitles,
+        backgrounds: backgrounds as unknown as Map<string, CanvasImageSource & { width: number; height: number }>,
+      });
       const buf = Buffer.from(ctx.getImageData(0, 0, width, height).data.buffer);
       if (!proc.stdin.write(buf)) await new Promise<void>((r) => proc.stdin.once("drain", () => r()));
       if (f % 15 === 0) onProgress("frames", f / frames);
